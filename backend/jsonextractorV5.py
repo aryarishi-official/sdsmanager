@@ -15,17 +15,17 @@ fields.
 This version uses a two-layer strategy:
 
   Layer 1 – REGEX on plain text (primary, high-confidence)
-      pdftotext -layout is called once per file.  The output preserves
-      horizontal spacing so multi-column footer lines appear as a single
-      long line.  Tight, field-specific regular expressions are applied
-      directly to this text.  Because each pattern is anchored to its
-      label ("Revision Date", "CAS No", etc.), it cannot accidentally
-      capture an adjacent column's value.
+      pdfplumber is used in both layout=True and layout=False modes.
+      Layout mode preserves horizontal spacing so multi-column footer
+      lines appear as a single long line, making it easy to parse
+      "Date of revision : X  Version : Y" without confusing values.
+      pdftotext (poppler) is used as an optional fallback if installed,
+      but is NOT required — the extractor runs fully on pdfplumber alone.
 
   Layer 2 – pdfplumber structured text (fallback / enrichment)
       For fields that the regex layer misses (or for richer section
-      content), pdfplumber provides page-by-page plain text that is used
-      to extract section bodies, hazard codes, exposure limits, etc.
+      content), pdfplumber plain text is used to extract section bodies,
+      hazard codes, exposure limits, etc.
 
 This means the critical identity fields (product name, CAS number,
 revision date, version) are extracted with simple, auditable regex and
@@ -33,31 +33,36 @@ are NOT affected by layout detection at all.
 
 Supported formats
 -----------------
-  • Airgas (Air Liquide)  – footer: "Date of issue/Date of revision : …"
-  • ThermoFisher / Fisher Scientific – header: "Revision Date DD-Mon-YYYY"
-  • NIST Standard Reference Materials – "Date of Issue: DD Month YYYY"
-  • Generic GHS SDS – falls back to broad date/version patterns
+  • Airgas (Air Liquide USA)    – footer: "Date of issue/Date of revision : …"
+  • Air Liquide India           – header table: SDS No./Revision/Issue Date
+  • ThermoFisher / Fisher       – header: "Revision Date DD-Mon-YYYY"
+  • Sigma-Aldrich / Merck       – generic GHS layout
+  • BASF / Dow / Avantor / 3M   – generic GHS layout
+  • Linde                       – similar to Airgas
+  • TCI                         – generic GHS layout
+  • NIST SRM                    – "Date of Issue: DD Month YYYY"
+  • Generic GHS SDS             – broad date/version patterns
 
 Output
 ------
-Returns a dict (and optionally writes JSON + HTML) with:
+Returns a dict (and optionally writes JSON) with:
   meta          – product_name, cas_numbers, revision_date, version,
                   previous_revision_date, sds_number, supplier,
                   signal_word, format_detected
-  hazards       – ghs_h_codes, ghs_p_codes, signal_word,
-                  hazard_classifications, pictograms (inferred from H-codes)
+  hazards       – h_codes, p_codes, signal_word,
+                  classifications, pictograms (inferred from H-codes)
+  hazard_statements – list of {code, statement} for every H/EUH code found
+                  works across all 10 major SDS publishers
   composition   – list of {name, cas, concentration}
   physical      – flash_point, boiling_point, melting_point,
                   autoignition_temp, vapor_pressure, density,
                   flammability_limits, solubility
-  exposure      – osha_pel, acgih_tlv, niosh_rel (where present)
+  exposure      – osha_pel, acgih_tlv, niosh_rel (kept internally; omitted from summary)
   transport     – un_number, proper_shipping_name, hazard_class,
                   packing_group
   sections_raw  – dict of section_number → plain text body
 """
-
 from __future__ import annotations
-
 import re
 import json
 import subprocess
@@ -70,14 +75,41 @@ from typing import Optional
 #  UTILITY: extract full plain text via pdftotext (layout mode)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _pdfplumber_extract(pdf_path: str, layout: bool) -> str:
+    """Extract text via pdfplumber. Tries layout=True/False, falls back to
+    plain extract_text() for older pdfplumber versions that lack layout param."""
+    import pdfplumber
+    parts = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            t = None
+            if layout:
+                # layout=True added in pdfplumber 0.7 — try it, fall back silently
+                try:
+                    t = page.extract_text(layout=True)
+                except TypeError:
+                    pass
+            if not t:
+                t = page.extract_text() or ""
+            parts.append(t)
+    return "\n".join(parts)
+
+
 def _pdftotext_layout(pdf_path: str) -> str:
     """
-    Run pdftotext -layout on the given PDF and return the full text.
-    Layout mode keeps multi-column footer lines on ONE line, which
-    makes it easy to parse "Date of revision : X  Version : Y" without
-    confusing the two values.
-    Falls back to pdfplumber if pdftotext is not available.
+    Extract text preserving horizontal layout (simulates pdftotext -layout).
+    Primary engine: pdfplumber — pure Python, no system deps, no poppler needed.
+    Optional fallback: pdftotext -layout if poppler happens to be installed.
     """
+    # Primary: pdfplumber
+    try:
+        text = _pdfplumber_extract(pdf_path, layout=True)
+        if text.strip():
+            return text
+    except Exception:
+        pass
+
+    # Fallback: pdftotext -layout (only if poppler is installed)
     try:
         result = subprocess.run(
             ["pdftotext", "-layout", "-enc", "UTF-8", pdf_path, "-"],
@@ -88,35 +120,34 @@ def _pdftotext_layout(pdf_path: str) -> str:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
 
-    # Fallback: pdfplumber
-    try:
-        import pdfplumber
-        parts = []
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text() or ""
-                parts.append(t)
-        return "\n".join(parts)
-    except Exception:
-        pass
-
     return ""
 
 
 def _pdftotext_plain(pdf_path: str) -> str:
     """
-    Run pdftotext (no layout) — cleaner for running section-body regexes
-    that span lines.
+    Extract plain text without layout preservation.
+    Primary engine: pdfplumber — pure Python, no system deps, no poppler needed.
+    Optional fallback: pdftotext if poppler is installed.
     """
+    # Primary: pdfplumber plain mode
+    try:
+        text = _pdfplumber_extract(pdf_path, layout=False)
+        if text.strip():
+            return text
+    except Exception:
+        pass
+
+    # Fallback: pdftotext plain (only if poppler is installed)
     try:
         result = subprocess.run(
             ["pdftotext", "-enc", "UTF-8", pdf_path, "-"],
             capture_output=True, text=True, timeout=30
         )
-        if result.returncode == 0:
+        if result.returncode == 0 and result.stdout.strip():
             return result.stdout
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
+
     return ""
 
 
@@ -127,12 +158,30 @@ def _pdftotext_plain(pdf_path: str) -> str:
 def detect_format(text: str) -> str:
     """
     Identify the SDS publisher format from the full text.
-    Returns one of: 'airgas', 'thermofisher', 'nist', 'generic'
+    Returns one of: 'airgas', 'airliquide_india', 'airliquide_malaysia',
+                    'thermofisher', 'nist', 'generic'
+
+    Air Liquide produces SDS documents under several regional subsidiaries,
+    each with a different layout:
+      - Airgas USA          → Airgas footer pattern
+      - Air Liquide India   → SDS No. / Issue Date header table
+      - Air Liquide Malaysia (ICOP format) → "Issue date: … Revision date: …"
+        header line, Section 1 uses "Trade name / Name" not "GHS product identifier"
     """
-    if re.search(r'Airgas\s+USA|Air\s+Liquide', text, re.I):
+    if re.search(r'Airgas\s+USA', text, re.I):
+        return 'airgas'
+    if re.search(r'Air\s+Liquide\s+India', text, re.I):
+        return 'airliquide_india'
+    # Air Liquide Malaysia: uses ICOP standard, header has "Issue date: … Revision date: …"
+    if re.search(r'AIR\s+LIQUIDE\s+MALAYSIA|according\s+to\s+ICOP', text, re.I):
+        return 'airliquide_malaysia'
+    # Remaining Air Liquide entities (non-India, non-Malaysia, non-Airgas) → airgas layout
+    if re.search(r'Air\s+Liquide', text, re.I):
         return 'airgas'
     if re.search(r'Thermo\s*Fisher|Fisher\s*Scientific', text, re.I):
         return 'thermofisher'
+    if re.search(r'Sigma-Aldrich|MilliporeSigma|Aldrich-\s*\d+', text, re.I):
+        return 'sigma'
     if re.search(r'National\s+Institute\s+of\s+Standards|NIST\b', text, re.I):
         return 'nist'
     return 'generic'
@@ -145,13 +194,15 @@ def detect_format(text: str) -> str:
 # Date patterns: M/D/YYYY  |  DD-Mon-YYYY  |  DD Month YYYY  |  Month DD, YYYY
 _DATE_RE = (
     r'(?:'
-    r'\d{1,2}/\d{1,2}/\d{4}'           # 5/6/2025
+    r'\d{1,2}/\d{1,2}/\d{4}'
     r'|'
-    r'\d{1,2}-[A-Za-z]{3}-\d{4}'       # 18-Dec-2025
+    r'\d{1,2}\.\d{1,2}\.\d{4}'          # ← ADD: 15.10.2025
     r'|'
-    r'\d{1,2}\s+[A-Za-z]+\s+\d{4}'    # 31 July 2015
+    r'\d{1,2}-[A-Za-z]{3}-\d{4}'
     r'|'
-    r'[A-Za-z]+\s+\d{1,2},?\s+\d{4}'  # May 21, 2009
+    r'\d{1,2}\s+[A-Za-z]+\s+\d{4}'
+    r'|'
+    r'[A-Za-z]+\s+\d{1,2},?\s+\d{4}'
     r')'
 )
 
@@ -225,6 +276,176 @@ def _extract_meta_airgas(text_layout: str, text_plain: str) -> dict:
 
     # ── Supplier ──
     meta['supplier'] = 'Airgas USA, LLC'
+
+    return meta
+
+
+
+def _extract_meta_airliquide_malaysia(text_layout: str, text_plain: str) -> dict:
+    """
+    Extract metadata for Air Liquide Malaysia SDS (ICOP 2014/2019 format).
+
+    Header line (page 1, plain text):
+        Issue date: 2/28/2017 Revision date: 10/30/2023 Supersedes: 3/1/2022 Version: 2.0
+      or (no revision, only issue):
+        Issue date: 3/28/2023 Version: 0.0
+
+    Section 1 identifiers (NOT 'GHS product identifier'):
+        Trade name : carbon monoxide
+        Name       : Carbon monoxide
+        CAS-No.    : 630-08-0
+        Product code : ALM/SDS/237
+
+    Supplier: always AIR LIQUIDE MALAYSIA SDN. BHD.
+    """
+    meta: dict = {}
+
+    # ── Revision date: prefer explicit "Revision date:" in header ───────────
+    # Pattern: "Revision date: 10/30/2023"
+    m = re.search(r'Revision\s+date\s*:\s*(' + _DATE_RE + r')', text_plain, re.I)
+    if m:
+        meta['revision_date'] = m.group(1).strip()
+
+    # ── Issue date (= original publication date, used when no revision date) ─
+    m = re.search(r'Issue\s+date\s*:\s*(' + _DATE_RE + r')', text_plain, re.I)
+    if m:
+        issue = m.group(1).strip()
+        # If no separate revision_date found, the issue date is the effective date
+        if not meta.get('revision_date'):
+            meta['revision_date'] = issue
+        meta['issue_date'] = issue   # always preserve as its own field
+
+    # ── Supersedes date (= previous revision) ────────────────────────────────
+    m = re.search(r'Supersedes\s*:\s*(' + _DATE_RE + r')', text_plain, re.I)
+    if m:
+        meta['previous_revision_date'] = m.group(1).strip()
+
+    # ── Version ──────────────────────────────────────────────────────────────
+    # Header: "Version: 2.0"  — appears on the same line as the dates
+    m = re.search(r'\bVersion\s*:\s*([\d]+\.[\d]+)', text_plain, re.I)
+    if m:
+        meta['version'] = m.group(1).strip()
+
+    # ── Product name: "Trade name : <value>" in Section 1 ───────────────────
+    # This SDS uses "Trade name" (not "GHS product identifier")
+    m = re.search(r'Trade\s+name\s*:\s*([^\n]+)', text_plain, re.I)
+    if m:
+        meta['product_name'] = m.group(1).strip()
+
+    # ── Chemical name: "Name : <value>" in Section 1 ────────────────────────
+    # Anchor carefully: "^Name" to avoid matching "Trade name"
+    m = re.search(r'(?:^|\n)Name\s*:\s*([^\n]+)', text_plain, re.I)
+    if m:
+        meta['chemical_name'] = m.group(1).strip()
+
+    # ── SDS / product code: "Product code : ALM/SDS/237" ────────────────────
+    m = re.search(r'Product\s+code\s*:\s*(\S+)', text_plain, re.I)
+    if m:
+        meta['sds_number'] = m.group(1).strip()
+
+    # ── Supplier ──────────────────────────────────────────────────────────────
+    meta['supplier'] = 'Air Liquide Malaysia Sdn. Bhd.'
+
+    # ── Signal word ───────────────────────────────────────────────────────────
+    m = re.search(r'Signal\s+word\s*\([^)]*\)\s*:\s*(Danger|Warning)', text_plain, re.I)
+    if not m:
+        m = re.search(r'\b(Danger|Warning)\b', text_plain, re.I)
+    if m:
+        meta['signal_word'] = m.group(1).capitalize()
+
+    return meta
+
+
+def _extract_meta_airliquide_india(text_layout: str, text_plain: str) -> dict:
+    """
+    Extract metadata for Air Liquide India SDS format.
+
+    The same publisher produces two layout variants across their SDS series:
+      Variant A (e.g. SDS-008 Nitrogen):   label + ' : ' + value  (colon present)
+      Variant B (e.g. SDS-006 Hydrogen):   label + '   ' + value  (NO colon, whitespace only)
+
+    Every field separator is therefore written as  \\s*:?\\s+  (colon optional).
+
+    Header block (top-right table, all pages):
+        SDS No.  : SDS – 006        ← en-dash common; ASCII hyphen also seen
+        Revision : 0
+        Issue Date : 04.09.2015
+
+    Section 1:
+        Trade/ Commercial Name [: ] Hydrogen (compressed)
+        Chemical Description   [: ] Hydrogen
+        Company Identification [: ] Air Liquide India Holding Pvt. Ltd.
+
+    Section 2 (inline signal word):
+        Flammable Gases – Category 1 – Danger (H220)
+    """
+    meta: dict = {}
+
+    # ── SDS number ──────────────────────────────────────────────────────────
+    # Header: "SDS No.  : SDS – 006"  or  "SDS No. : SDS - 008"
+    # Colon is always present in the header table; dash may be en-dash or hyphen.
+    m = re.search(r'SDS\s+No\.?\s*:\s*(SDS\s*[-\u2013\u2014]\s*\d+)', text_layout, re.I)
+    if m:
+        sds_val = re.sub(r'[\u2013\u2014]', '-', m.group(1))   # normalise dash
+        meta['sds_number'] = re.sub(r'\s+', ' ', sds_val).strip()
+
+    # ── Revision / version ───────────────────────────────────────────────────
+    # "Revision : 0"  — colon always present in header table
+    m = re.search(r'\bRevision\s*:\s*(\d+)', text_layout, re.I)
+    if m:
+        meta['version'] = m.group(1).strip()
+
+    # ── Issue / revision date ─────────────────────────────────────────────────
+    # "Issue Date : 04.09.2015"
+    m = re.search(r'Issue\s+Date\s*:\s*(\d{2}\.\d{2}\.\d{4})', text_layout, re.I)
+    if m:
+        meta['revision_date'] = m.group(1).strip()
+
+    # ── Product / trade name ─────────────────────────────────────────────────
+    # Variant A: "Trade/ Commercial Name : Nitrogen Compressed"
+    # Variant B: "Trade/ Commercial Name Hydrogen (compressed)"
+    # Separator: \s*:?\s+  (colon optional, surrounded by whitespace)
+    m = re.search(
+        r'Trade\s*[/\s]\s*Commercial\s+Name\s*:?\s+([^\n]+)',
+        text_plain, re.I
+    )
+    if m:
+        meta['product_name'] = m.group(1).strip()
+
+    # ── Chemical name ────────────────────────────────────────────────────────
+    # Variant A: "Chemical Description : Nitrogen"
+    # Variant B: "Chemical Description Hydrogen"
+    # Next line may start with "CAS No: ..." (continuation) — stop there.
+    m = re.search(
+        r'Chemical\s+Description\s*:?\s+([^\n]+)',
+        text_plain, re.I
+    )
+    if m:
+        val = m.group(1).strip()
+        # Strip same-line "CAS No:..." tail that some variants include
+        val = re.split(r'\s*,?\s*CAS\s+No', val, flags=re.I)[0].strip()
+        meta['chemical_name'] = val
+
+    # ── Supplier ─────────────────────────────────────────────────────────────
+    # Variant A: "Company Identification : Air Liquide India..."
+    # Variant B: "Company Identification Air Liquide India..."
+    m = re.search(
+        r'Company\s+Identification\s*:?\s+(.+?)(?:\n\s*\n|\nEmergency)',
+        text_plain, re.I | re.S
+    )
+    if m:
+        lines = [l.strip() for l in m.group(1).split('\n') if l.strip()]
+        meta['supplier'] = lines[0] if lines else 'Air Liquide India Holding Pvt. Ltd.'
+    else:
+        meta['supplier'] = 'Air Liquide India Holding Pvt. Ltd.'
+
+    # ── Signal word ───────────────────────────────────────────────────────────
+    # Inline in Physical Hazards line: "... – Danger (H220)"
+    m = re.search(r'[-\u2013\u2014]\s*(Warning|Danger)\s*\(H\d+\)', text_plain, re.I)
+    if not m:
+        m = re.search(r'\b(Warning|Danger)\b', text_plain, re.I)
+    if m:
+        meta['signal_word'] = m.group(1).capitalize()
 
     return meta
 
@@ -305,6 +526,56 @@ def _extract_meta_nist(text_layout: str, text_plain: str) -> dict:
     meta['supplier'] = 'NIST – National Institute of Standards and Technology'
     return meta
 
+def _extract_meta_sigma(text_layout: str, text_plain: str) -> dict:
+    """
+    Sigma-Aldrich / Merck / MilliporeSigma SDS (EC 1907/2006 format).
+
+    Header block (layout mode, top-right, single lines):
+        Version 6.3
+        Revision Date 15.10.2025
+        Print Date 12.05.2026
+
+    Section 1:
+        Product name : Nitrogen
+        Product Number : 295574
+        Brand : Aldrich
+        CAS-No. : 7727-37-9
+    """
+    meta: dict = {}
+
+    # ── Revision date: "Revision Date 15.10.2025" ────────────────────────────
+    m = re.search(r'Revision\s+Date\s+(' + _DATE_RE + r')', text_layout, re.I)
+    if m:
+        meta['revision_date'] = m.group(1).strip()
+
+    # ── Print date (used as previous/reference date) ──────────────────────────
+    m = re.search(r'Print\s+Date\s+(' + _DATE_RE + r')', text_layout, re.I)
+    if m:
+        meta['issue_date'] = m.group(1).strip()
+
+    # ── Version: "Version 6.3" ────────────────────────────────────────────────
+    m = re.search(r'\bVersion\s+([\d]+\.[\d]+)', text_layout, re.I)
+    if m:
+        meta['version'] = m.group(1).strip()
+
+    # ── Product name: "Product name : Nitrogen" ───────────────────────────────
+    m = re.search(r'Product\s+name\s*:\s*([^\n]+)', text_plain, re.I)
+    if m:
+        meta['product_name'] = m.group(1).strip()
+
+    # ── Product number (SDS/catalogue number) ─────────────────────────────────
+    m = re.search(r'Product\s+Number\s*:\s*(\S+)', text_plain, re.I)
+    if m:
+        meta['sds_number'] = m.group(1).strip()
+
+    # ── Supplier: Company field in Section 1 ──────────────────────────────────
+    m = re.search(r'Company\s*:\s*([^\n]+)', text_plain, re.I)
+    if m:
+        meta['supplier'] = m.group(1).strip()
+    else:
+        meta['supplier'] = 'Sigma-Aldrich / Merck'
+
+    return meta
 
 def _extract_meta_generic(text_layout: str, text_plain: str) -> dict:
     """
@@ -350,6 +621,21 @@ def extract_cas_numbers(text: str) -> list[dict]:
     """
     results: list[dict] = []
     seen_cas: set[str] = set()
+
+    # ── Strategy 0: standalone "CAS-No. : XXXXXXX" with nearby "Formula" ──────
+# Sigma-Aldrich Section 3 lists substance fields as separate label lines,
+# not as a table row. Detect this pattern and build one entry from it.
+    standalone = re.search(
+        r'(?:Formula\s*:\s*([^\n]+)\n)?'           # optional formula line
+        r'(?:Molecular\s+weight[^\n]*\n)?'          # skip mol weight line
+        r'CAS-No\.\s*:\s*(' + _CAS_RE + r')',
+        text, re.I
+    )   
+    if standalone:
+        cas = standalone.group(2).strip()
+        if cas not in seen_cas:
+            seen_cas.add(cas)
+            results.append({'name': None, 'cas': cas, 'concentration': '100'})
 
     # ── Strategy 1: composition table rows ──────────────────────────────────
     # After "Section 3" or "Composition/information on ingredients"
@@ -523,6 +809,74 @@ def extract_hazards(text: str) -> dict:
     }
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HAZARD STATEMENT TEXT EXTRACTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Regex covers all 10 major SDS suppliers (Airgas, Air Liquide India,
+# ThermoFisher/Fisher, Sigma-Aldrich/Merck, BASF, Dow, Avantor/VWR,
+# Linde, 3M, TCI, NIST).  Three real-world variants:
+#   Variant A – "H302: Harmful if swallowed."        (code + colon + text)
+#   Variant B – "H302 Harmful if swallowed"          (code + space  + text)
+#   Variant C – "Hazard Statement: H302: ..."        (label prefix,  handled by A)
+#   Combined  – "H300 + H310: Fatal if swallowed..." (multi-code combos)
+#   EUH codes – "EUH066: Repeated exposure may ..."  (EU supplemental)
+_HSTMT_RE = re.compile(
+    r'\b((?:EUH\d{3}[A-Za-z]?|H[2-4]\d{2}[A-Za-z]?)'
+    r'(?:\s*\+\s*(?:EUH\d{3}[A-Za-z]?|H[2-4]\d{2}[A-Za-z]?))*)'
+    r'\s*:?\s+'
+    r'([A-Z][^\n]{10,150})',
+    re.I
+)
+
+# Words that indicate a false positive (H-code followed by noise, not a statement)
+_HSTMT_NOISE = re.compile(
+    r'^(?:see|page|refer|note|above|below|code|ppm|mg|cf\.|per|via|and|or|in|is|are|the)\b',
+    re.I
+)
+
+
+def extract_hazard_statements(text: str) -> list[dict]:
+    """
+    Extract GHS hazard statement texts paired with their H-codes.
+
+    Works across all major SDS publishers by handling the three real-world
+    layout variants (colon-separated, space-separated, label-prefixed).
+    Deduplicates by normalised code string so Section 2 + Section 16
+    repetitions produce only one entry each.
+
+    Returns
+    -------
+    list of {'code': str, 'statement': str} dicts, sorted by code.
+    Examples:
+        [{'code': 'H280', 'statement': 'Contains gas under pressure; may explode if heated.'}]
+        [{'code': 'H300 + H310', 'statement': 'Fatal if swallowed or in contact with skin.'}]
+    """
+    seen: dict[str, str] = {}   # normalised_code -> statement
+
+    for m in _HSTMT_RE.finditer(text):
+        code = re.sub(r'\s+', ' ', m.group(1)).strip().upper()
+        stmt = m.group(2).strip()
+
+        # Reject noise (statement starts with a non-content word)
+        if _HSTMT_NOISE.match(stmt):
+            continue
+
+        # De-duplicate: first occurrence wins (Section 2 appears before Sec 16)
+        if code not in seen:
+            # Clean trailing artefacts: page refs, repeated spaces
+            stmt = re.split(r'\s{3,}|\bPage\b|\bSection\b', stmt)[0].strip()
+            stmt = re.sub(r'\s+', ' ', stmt)
+            seen[code] = stmt
+
+    return [
+        {'code': code, 'statement': stmt}
+        for code, stmt in sorted(seen.items())
+    ]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  PHYSICAL/CHEMICAL PROPERTIES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -570,7 +924,7 @@ def extract_physical_properties(text: str) -> dict:
 
     # Boiling point
     m = re.search(
-        r'[Bb]oiling\s+[Pp]oint(?:/[Rr]ange)?\s*[:\s]*(-?\d[\d\s\.\-°CFf]*)',
+        r'[Bb]oiling[\s/]+(?:Condensation\s+)?[Pp]oint(?:/[Rr]ange)?\s*[:\s]*(-?\d[\d\s\.\-°°CFf]*)',
         text, re.I
     )
     if m:
@@ -688,6 +1042,8 @@ def extract_transport(text: str) -> dict:
 
     # UN number (most reliable single field)
     m = re.search(r'\bUN\s*(\d{4})\b', text)
+    if not m:
+        m = re.search(r'UN\s+Number\s*:\s*(\d{4})', text, re.I)
     if m:
         transport['un_number'] = 'UN' + m.group(1)
 
@@ -817,10 +1173,16 @@ def extract_sds(pdf_path: str) -> dict:
     fmt = detect_format(text_for_regex)
 
     # ── Extract metadata per format ────────────────────────────────────────
-    if fmt == 'airgas':
+    if fmt == 'airliquide_india':
+        meta = _extract_meta_airliquide_india(text_layout, text_plain)
+    elif fmt == 'airliquide_malaysia':
+        meta = _extract_meta_airliquide_malaysia(text_layout, text_plain)
+    elif fmt == 'airgas':
         meta = _extract_meta_airgas(text_layout, text_plain)
     elif fmt == 'thermofisher':
         meta = _extract_meta_thermofisher(text_layout, text_plain)
+    elif fmt == 'sigma':
+        meta = _extract_meta_sigma(text_layout, text_plain)
     elif fmt == 'nist':
         meta = _extract_meta_nist(text_layout, text_plain)
     else:
@@ -831,7 +1193,7 @@ def extract_sds(pdf_path: str) -> dict:
     # ── Shared fields across all formats ──────────────────────────────────
     # Signal word
     sw = re.search(r'\bSignal\s+[Ww]ord\s*:?\s*(Danger|Warning)', text_for_regex, re.I)
-    if sw:
+    if sw and not meta.get('signal_word'):
         meta['signal_word'] = sw.group(1).capitalize()
 
     # ── Section bodies ─────────────────────────────────────────────────────
@@ -850,6 +1212,17 @@ def extract_sds(pdf_path: str) -> dict:
     hazards = extract_hazards(text_for_regex)
     if hazards.get('signal_word') and not meta.get('signal_word'):
         meta['signal_word'] = hazards['signal_word']
+
+    # ── Hazard statements (code + full text) ─────────────────────────────
+    # Prefer Section 2 text so Sec 16 repetitions don't create duplicates;
+    # fall back to full text if Section 2 was not parsed.
+    sec2_text = sections.get('2', {}).get('text', text_for_regex)
+    if len(sec2_text.strip()) < 50:          # section parse missed it
+        sec2_text = text_for_regex
+    hazard_statements = extract_hazard_statements(sec2_text)
+    # If nothing found in sec2, widen to full text
+    if not hazard_statements:
+        hazard_statements = extract_hazard_statements(text_for_regex)
 
     # ── Physical properties ───────────────────────────────────────────────
     # Prefer layout text: ThermoFisher PDFs render property values on the
@@ -878,6 +1251,7 @@ def extract_sds(pdf_path: str) -> dict:
     return {
         'meta': meta,
         'hazards': hazards,
+        'hazard_statements': hazard_statements,
         'composition': composition,
         'physical': physical,
         'exposure': exposure,
@@ -888,147 +1262,12 @@ def extract_sds(pdf_path: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  HTML REPORT GENERATOR
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _esc(s) -> str:
-    return str(s).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-
-
-def render_html(result: dict, title: str = '') -> str:
-    """
-    Render extraction results as a clean HTML page.
-    """
-    m = result['meta']
-    h = result['hazards']
-    comp = result['composition']
-    phys = result['physical']
-    exp  = result['exposure']
-    trans = result['transport']
-    tox  = result['toxicology']
-
-    def kv_rows(d: dict) -> str:
-        rows = ''
-        for k, v in d.items():
-            if v is None:
-                continue
-            if isinstance(v, (dict, list)):
-                v = json.dumps(v, ensure_ascii=False)
-            rows += f'<tr><td class="label">{_esc(k)}</td><td>{_esc(v)}</td></tr>\n'
-        return rows
-
-    def section_table(heading: str, d: dict) -> str:
-        if not any(v for v in d.values() if v is not None and v != {} and v != []):
-            return ''
-        return (
-            f'<h3>{_esc(heading)}</h3>'
-            f'<table><tbody>{kv_rows(d)}</tbody></table>'
-        )
-
-    # Composition table
-    comp_html = ''
-    if comp:
-        comp_html = '<h3>Composition / Ingredients</h3><table>'
-        comp_html += '<thead><tr><th>Name</th><th>CAS Number</th><th>Concentration</th></tr></thead><tbody>'
-        for c in comp:
-            comp_html += (
-                f'<tr><td>{_esc(c["name"])}</td>'
-                f'<td><code>{_esc(c["cas"])}</code></td>'
-                f'<td>{_esc(c.get("concentration") or "")}</td></tr>'
-            )
-        comp_html += '</tbody></table>'
-
-    # Hazard codes
-    haz_html = ''
-    if h['h_codes']:
-        h_badges = ' '.join(
-            f'<span class="badge h-badge">{_esc(c)}</span>' for c in h['h_codes']
-        )
-        p_badges = ' '.join(
-            f'<span class="badge p-badge">{_esc(c)}</span>' for c in h['p_codes']
-        )
-        ghs_badges = ' '.join(
-            f'<span class="badge ghs-badge">{_esc(p["ghs_code"])}</span>'
-            for p in h['pictograms']
-        )
-        haz_html = (
-            f'<h3>Hazards</h3>'
-            f'<p><strong>Signal word:</strong> {_esc(h.get("signal_word") or "—")}</p>'
-            f'<p><strong>GHS Pictograms (inferred):</strong> {ghs_badges or "—"}</p>'
-            f'<p><strong>H-Codes:</strong> {h_badges}</p>'
-            f'<p><strong>P-Codes:</strong> {p_badges or "—"}</p>'
-        )
-        if h['classifications']:
-            haz_html += '<ul>' + ''.join(
-                f'<li>{_esc(c)}</li>' for c in h['classifications']
-            ) + '</ul>'
-
-    product = m.get('product_name') or m.get('chemical_name') or title
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>SDS – {_esc(product)}</title>
-  <style>
-    body  {{ font-family: Arial, sans-serif; font-size: 13px; margin: 24px; color: #222; max-width: 1100px; }}
-    h2    {{ color: #1a1a6e; border-bottom: 2px solid #1a1a6e; padding-bottom: 6px; }}
-    h3    {{ color: #2c5f8a; margin-top: 20px; margin-bottom: 6px; }}
-    table {{ border-collapse: collapse; width: 100%; margin-bottom: 12px; }}
-    th, td {{ border: 1px solid #ccc; padding: 5px 10px; vertical-align: top; text-align: left; }}
-    th    {{ background: #e0e8f4; font-weight: bold; }}
-    td.label {{ background: #f5f7fa; font-weight: bold; white-space: nowrap; width: 220px; }}
-    code  {{ background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }}
-    .badge {{ display: inline-block; border-radius: 4px; padding: 2px 7px; margin: 2px;
-              font-size: 11px; font-weight: bold; }}
-    .h-badge  {{ background: #f8d7da; color: #721c24; }}
-    .p-badge  {{ background: #fff3cd; color: #856404; }}
-    .ghs-badge {{ background: #d4edda; color: #155724; }}
-    .meta-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 0; }}
-    .meta-grid table {{ margin: 0; }}
-    .highlight {{ background: #fffde7; }}
-  </style>
-</head>
-<body>
-  <h2>Safety Data Sheet — {_esc(product)}</h2>
-  <p style="color:#555;font-size:12px">
-    Source: <code>{_esc(m.get("source_file",""))}</code> &nbsp;|&nbsp;
-    Format: <strong>{_esc(m.get("format_detected",""))}</strong>
-  </p>
-
-  <h3>Identity &amp; Version</h3>
-  <table>
-    <tbody>
-      <tr class="highlight"><td class="label">Product Name</td><td><strong>{_esc(m.get("product_name") or m.get("chemical_name") or "—")}</strong></td></tr>
-      <tr><td class="label">Chemical Name</td><td>{_esc(m.get("chemical_name") or "—")}</td></tr>
-      <tr class="highlight"><td class="label">CAS Number (primary)</td><td><code>{_esc(m.get("cas_number_primary") or "—")}</code></td></tr>
-      <tr class="highlight"><td class="label">Revision Date</td><td>{_esc(m.get("revision_date") or "—")}</td></tr>
-      <tr><td class="label">Previous Revision Date</td><td>{_esc(m.get("previous_revision_date") or m.get("creation_date") or "—")}</td></tr>
-      <tr class="highlight"><td class="label">Version / Revision Number</td><td>{_esc(m.get("version") or "—")}</td></tr>
-      <tr><td class="label">SDS / SRM Number</td><td>{_esc(m.get("sds_number") or m.get("srm_number") or "—")}</td></tr>
-      <tr><td class="label">Signal Word</td><td>{_esc(m.get("signal_word") or "—")}</td></tr>
-      <tr><td class="label">Supplier</td><td>{_esc(m.get("supplier") or "—")}</td></tr>
-    </tbody>
-  </table>
-
-  {haz_html}
-  {comp_html}
-  {section_table("Physical &amp; Chemical Properties", phys)}
-  {section_table("Exposure Limits", exp)}
-  {section_table("Transport Information", trans)}
-  {section_table("Toxicology", tox)}
-</body>
-</html>"""
-    return html
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  BATCH PROCESSING ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_batch(pdf_paths: list[str], out_dir: str = 'sds_output') -> dict:
     """
-    Process a list of SDS PDFs.  Writes one JSON + one HTML per file
+    Process a list of SDS PDFs.  Writes one JSON per file
     into out_dir.  Returns a summary dict of all extracted results.
 
     Parameters
@@ -1061,12 +1300,6 @@ def process_batch(pdf_paths: list[str], out_dir: str = 'sds_output') -> dict:
                 encoding='utf-8'
             )
 
-            # Write HTML
-            html_path = out / f'{name}.html'
-            html_path.write_text(
-                render_html(result, title=name),
-                encoding='utf-8'
-            )
 
             meta = result['meta']
             print(
@@ -1103,6 +1336,7 @@ def process_batch(pdf_paths: list[str], out_dir: str = 'sds_output') -> dict:
             'hazard_class':    r['transport'].get('hazard_class'),
             'flash_point':     r['physical'].get('flash_point'),
             'h_codes':         r['hazards'].get('h_codes', []),
+            'hazard_statements': r.get('hazard_statements', []),
             'pictograms':      [p['ghs_code'] for p in r['hazards'].get('pictograms', [])],
             'composition':     r['composition'],
         }
@@ -1246,10 +1480,9 @@ Examples:
             'flash_point':          r['physical'].get('flash_point'),
             'boiling_point':        r['physical'].get('boiling_point'),
             'h_codes':              r['hazards'].get('h_codes', []),
+            'hazard_statements':    r.get('hazard_statements', []),
             'pictograms':           [p['ghs_code'] for p in r['hazards'].get('pictograms', [])],
             'composition':          r['composition'],
-            'osha_pel':             r['exposure'].get('osha_pel_twa'),
-            'acgih_tlv':            r['exposure'].get('acgih_tlv_twa'),
             'source_file':          m.get('source_file'),
         }
 

@@ -16,7 +16,7 @@ import copy
 # pyrefly: ignore [missing-import]
 from fastapi.staticfiles import StaticFiles
 from schemas import UserCreate, UserLogin
-from auth import hash_password, verify_password, create_access_token
+from auth import hash_password, verify_password, create_access_token,require_role
 from fastapi.exceptions import HTTPException
 
 
@@ -89,7 +89,8 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     new_user = User(
         name=user.name,
         email=user.email,
-        password=hashed_pw
+        password=hashed_pw,
+        role=user.role
     )
     db.add(new_user)
     db.commit()
@@ -121,12 +122,15 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
         )
 
     token = create_access_token(
-        data={"sub": db_user.email}
+        data={"sub": db_user.email,
+        "role": db_user.role}
     )
 
     return {
         "access_token": token,
-        "token_type": "bearer"
+        "token_type": "bearer",
+        "role": db_user.role,
+        "name": db_user.name
     }
 from auth import verify_token    
 @app.get("/profile")
@@ -137,7 +141,13 @@ def profile(current_user: str = Depends(verify_token)):
     }
 
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...),current_user: str = Depends(verify_token)):
+@app.post("/analyze")
+async def analyze(
+    file: UploadFile = File(...),
+    current_user = Depends(
+        require_role(["admin", "editor"])
+    )
+):
     file_path = os.path.join(UPLOAD_DIR, file.filename)
 
     # Save file
@@ -229,10 +239,55 @@ async def analyze(file: UploadFile = File(...),current_user: str = Depends(verif
 
     """ return {"document_id": doc.id, "hazard_pictograms": doc.hazard_pictograms or []} """
     return {"document_id": doc.id, "hazard_pictograms": doc.hazard_pictograms or [], "normalized": normalized}
+from sqlalchemy import or_
+from typing import Optional
+@app.get("/documents/search")
+def search_documents(
+    q: Optional[str] = None,
+    current_user = Depends(
+        require_role([
+            "admin",
+            "editor",
+            "viewer"
+        ])
+    ),
+    db: Session = Depends(get_db)
+):
+    query = db.query(SDSDocument)
 
+    if q:
+        query = query.filter(
+            or_(
+                SDSDocument.product_name.ilike(f"%{q}%"),
+                SDSDocument.file_name.ilike(f"%{q}%"),
+                SDSDocument.signal_word.ilike(f"%{q}%")
+            )
+        )
+
+    results = query.order_by(SDSDocument.id.desc()).all()
+
+    return [
+        {
+            "id": doc.id,
+            "file_name": doc.file_name,
+            "product_name": doc.product_name,
+            "signal_word": doc.signal_word,
+            "uploaded_at": doc.uploaded_at.isoformat()
+            if doc.uploaded_at else None,
+            "hazard_pictograms": doc.hazard_pictograms or [],
+            "pdf_url": f"http://localhost:8000/uploads/{doc.file_name}",
+        }
+        for doc in results
+    ]
 
 @app.get("/documents/{doc_id}")
-def get_document(doc_id: int,current_user: str = Depends(verify_token),db: Session = Depends(get_db)):
+def get_document(doc_id: int,current_user = Depends(
+        require_role([
+            "admin",
+            "editor",
+            "viewer"
+        ])
+    ),db: Session = Depends(get_db)):
     doc = db.query(SDSDocument).filter(SDSDocument.id == doc_id).first()
 
     sections = db.query(Section).filter(Section.document_id == doc_id).all()
@@ -293,7 +348,13 @@ def get_documents(db: Session = Depends(get_db)):
         for doc in docs
     ] """
 @app.get("/documents")
-def get_documents(db: Session = Depends(get_db)):
+def get_documents(current_user = Depends(
+        require_role([
+            "admin",
+            "editor",
+            "viewer"
+        ])
+    ),db: Session = Depends(get_db),):
     docs = db.query(SDSDocument).order_by(SDSDocument.id.desc()).all()
 
     results = []
@@ -353,7 +414,7 @@ def get_documents(db: Session = Depends(get_db)):
 
 
 @app.delete("/documents/{doc_id}")
-def delete_document(doc_id: int, db: Session = Depends(get_db)):
+def delete_document(doc_id: int, db: Session = Depends(get_db),current_user = Depends(require_role(["admin"])),):
 
     doc = db.query(SDSDocument).filter(SDSDocument.id == doc_id).first()
 

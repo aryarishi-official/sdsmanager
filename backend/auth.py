@@ -1,3 +1,4 @@
+import sre_compile
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -54,6 +55,7 @@ def verify_token(token: str = Depends(oauth2_scheme)):
         )
 
         email = payload.get("sub")
+        role = payload.get("role")
 
         if email is None:
             raise HTTPException(
@@ -61,10 +63,29 @@ def verify_token(token: str = Depends(oauth2_scheme)):
                 detail="Invalid token"
             )
 
-        return email
+        return {
+    "email": email,
+    "role": role
+}
 
     except JWTError:
         raise HTTPException(
             status_code=401,
             detail="Invalid token"
         )
+
+def require_role(allowed_roles: list):
+
+    def role_checker(current_user = Depends(verify_token)):
+
+        user_role = current_user["role"]
+
+        if user_role not in allowed_roles:
+            raise HTTPException(
+                status_code=403,
+                detail="Permission denied"
+            )
+
+        return current_user
+
+    return role_checker
