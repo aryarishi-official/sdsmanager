@@ -26,6 +26,7 @@ export function SignupDialog({
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
     const [submitting, setSubmitting] = useState(false);
+    const [role, setRole] = useState("viewer")
 
     async function handleSubmit(e: FormEvent) {
         e.preventDefault();
@@ -45,6 +46,7 @@ export function SignupDialog({
                         name,
                         email,
                         password,
+                        role
                     }),
                 }
             );
@@ -117,6 +119,14 @@ export function SignupDialog({
                             autoComplete="new-password"
                         />
                     </div>
+                    <select
+                        value={role}
+                        onChange={(e) => setRole(e.target.value)}
+                    >
+                        <option value="viewer">Viewer</option>
+                        <option value="editor">Editor</option>
+                        <option value="admin">Admin</option>
+                    </select>
                     <Button type="submit" className="w-full" disabled={submitting}>
                         {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : "Create account"}
                     </Button>

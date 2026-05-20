@@ -83,6 +83,7 @@ export function SdsTable({
   rows?: SdsRow[];
   onDelete?: (id: number) => void;
 }) {
+  const role = localStorage.getItem("role")
   return (
     <TooltipProvider delayDuration={150}>
       <div className="overflow-hidden rounded-xl border bg-card shadow-sm">
@@ -201,19 +202,21 @@ export function SdsTable({
                           {r.pdf_url ? "View PDF" : "PDF not available"}
                         </TooltipContent>
                       </Tooltip>
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Button
-                            size="icon"
-                            variant="ghost"
-                            className="h-8 w-8 text-destructive hover:bg-destructive/10 hover:text-destructive"
-                            onClick={() => onDelete?.(r.id)}
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </Button>
-                        </TooltipTrigger>
-                        <TooltipContent>Delete</TooltipContent>
-                      </Tooltip>
+                      {role === "admin" && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              className="h-8 w-8 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                              onClick={() => onDelete?.(r.id)}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>Delete</TooltipContent>
+                        </Tooltip>
+                      )}
                     </div>
                   </td>
                 </tr>

@@ -94,6 +94,7 @@ function SdsDetailPage() {
   useEffect(() => {
 
     const token = localStorage.getItem("token");
+    const role = localStorage.getItem("role");
 
     setLoading(true);
 
@@ -226,12 +227,12 @@ function SdsDetailPage() {
                   label="Product Name"
                   value={doc?.normalized?.product_name || doc?.product_name || "—"}
                 />
-                <Row label="Trade Name / SRM Name" value={pick(sec1, "trade name", "srm name", "commercial name")} />
-                <Row label="Product Identifier" value={pick(sec1, "product identifier", "product code", "srm number", "article no")} />
+
+
                 <Row label="Manufacturer / Supplier" value={pick(sec1, "company", "supplier", "manufacturer", "producer")} />
                 <Row label="Recommended Use" value={doc?.normalized?.recommended_use || "—"} />
                 <Row label="Revision Date" value={doc?.normalized?.revision_date || "—"} />
-                < Row label="SDS Version" value={pick(sec1, "version", "revision no", "sds version")} />
+
                 <Row label="Upload ID" value={`#${id}`} />
               </InfoCard>
 

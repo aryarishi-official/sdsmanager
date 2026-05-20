@@ -4,6 +4,7 @@ import { FlaskConical, ShieldCheck, Sparkles, ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { LoginDialog } from "@/components/login-dialog";
 import heroImage from "@/assets/sds.png";
+import { useNavigate } from "@tanstack/react-router";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -27,7 +28,16 @@ const NAV_LINKS = [
 
 function LandingPage() {
   const [loginOpen, setLoginOpen] = useState(false);
+  const navigate = useNavigate();  // ← add this
 
+  function handleViewLibrary() {
+    const token = localStorage.getItem("token") ?? sessionStorage.getItem("token");
+    if (token) {
+      navigate({ to: "/sds" });   // already logged in → go straight to dashboard
+    } else {
+      setLoginOpen(true);          // not logged in → show login modal
+    }
+  }
   return (
     <div className="relative min-h-screen overflow-hidden bg-background text-foreground">
       {/* Background accents */}
@@ -65,7 +75,7 @@ function LandingPage() {
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => setLoginOpen(true)}
+              onClick={handleViewLibrary}
               className="text-sm"
             >
               Login
@@ -96,7 +106,7 @@ function LandingPage() {
               from one calm, modern dashboard.
             </p>
             <div className="flex flex-wrap items-center gap-3 pt-2">
-              <Button size="lg" onClick={() => setLoginOpen(true)} className="group">
+              <Button size="lg" onClick={handleViewLibrary} className="group">
                 View my SDS library
                 <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
               </Button>

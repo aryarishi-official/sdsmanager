@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useState, useEffect, type FormEvent } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { Loader2 } from "lucide-react";
 import {
@@ -11,6 +11,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Checkbox } from "@/components/ui/checkbox";
 import { SignupDialog } from "@/components/signup-dialog";
 
 function GoogleIcon() {
@@ -19,6 +20,20 @@ function GoogleIcon() {
       <path fill="#EA4335" d="M12 10.2v3.9h5.5c-.24 1.4-1.7 4.1-5.5 4.1-3.3 0-6-2.7-6-6.1s2.7-6.1 6-6.1c1.9 0 3.1.8 3.8 1.5l2.6-2.5C16.8 3.5 14.6 2.5 12 2.5 6.8 2.5 2.6 6.7 2.6 12S6.8 21.5 12 21.5c6.9 0 9.4-4.8 9.4-7.4 0-.5 0-.9-.1-1.3H12z" />
     </svg>
   );
+}
+
+// Use localStorage when remembered, sessionStorage otherwise
+function saveSession(data: { token: string; role: string; name: string }, remember: boolean) {
+  const storage = remember ? localStorage : sessionStorage;
+  // Clear both so there's no stale session in the other one
+  ["token", "role", "name", "rememberMe"].forEach((k) => {
+    localStorage.removeItem(k);
+    sessionStorage.removeItem(k);
+  });
+  storage.setItem("token", data.token);
+  storage.setItem("role", data.role);
+  storage.setItem("name", data.name);
+  if (remember) localStorage.setItem("rememberMe", "true");
 }
 
 export function LoginDialog({
@@ -31,53 +46,44 @@ export function LoginDialog({
   const navigate = useNavigate();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [rememberMe, setRememberMe] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [signupOpen, setSignupOpen] = useState(false);
+
+  // Pre-fill email if user previously checked "Remember me"
+  useEffect(() => {
+    const remembered = localStorage.getItem("rememberMe") === "true";
+    if (remembered) {
+      setRememberMe(true);
+    }
+  }, []);
+
   async function handleSubmit(e: FormEvent) {
-
     e.preventDefault();
-
     setSubmitting(true);
 
     try {
-
-      const response = await fetch(
-        "http://127.0.0.1:8000/login",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            email,
-            password,
-          }),
-        }
-      );
+      const response = await fetch("http://127.0.0.1:8000/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
 
       const data = await response.json();
 
-      if (!response.ok) {
-        throw new Error(data.detail || "Login failed");
-      }
+      if (!response.ok) throw new Error(data.detail || "Login failed");
 
-      // Store JWT token
-      localStorage.setItem(
-        "token",
-        data.access_token
+      saveSession(
+        { token: data.access_token, role: data.role, name: data.name },
+        rememberMe
       );
 
-      setSubmitting(false);
-
       onOpenChange(false);
-
       navigate({ to: "/sds" });
-
     } catch (error: any) {
-
-      setSubmitting(false);
-
       alert(error.message);
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -138,6 +144,19 @@ export function LoginDialog({
                 autoComplete="current-password"
               />
             </div>
+
+            {/* Remember me */}
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="remember-me"
+                checked={rememberMe}
+                onCheckedChange={(checked) => setRememberMe(checked === true)}
+              />
+              <Label htmlFor="remember-me" className="cursor-pointer text-sm font-normal text-muted-foreground">
+                Remember me
+              </Label>
+            </div>
+
             <Button type="submit" className="w-full" disabled={submitting}>
               {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : "Login"}
             </Button>

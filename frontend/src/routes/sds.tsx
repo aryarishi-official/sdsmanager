@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, redirect } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
 import { Search, Calendar, Upload, Download, SlidersHorizontal } from "lucide-react";
 import { PageShell } from "@/components/page-shell";
@@ -17,7 +17,21 @@ import {
 
 const API_BASE = "http://localhost:8000";
 
+function getToken() {
+  // Guard: only runs in browser, not SSR
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem("token") ?? sessionStorage.getItem("token");
+}
+
 export const Route = createFileRoute("/sds")({
+  beforeLoad: () => {
+    // typeof window === "undefined" means SSR — skip the check, let the
+    // client-side useEffect handle it. Only redirect when we're in the browser
+    // and there is genuinely no token in either storage.
+    if (typeof window !== "undefined" && !getToken()) {
+      throw redirect({ to: "/" });
+    }
+  },
   head: () => ({
     meta: [
       { title: "All SDS — SDS Manager" },
@@ -31,16 +45,41 @@ export const Route = createFileRoute("/sds")({
 });
 
 function AllSdsPage() {
-  // Default to the "completed" tab
+  const navigate = Route.useNavigate();
+
+  // Client-side guard: catches the case where beforeLoad was skipped (SSR)
+  // and the page hydrates with no token.
+  useEffect(() => {
+    if (!getToken()) {
+      navigate({ to: "/" });
+    }
+  }, [navigate]);
+
   const [tab, setTab] = useState<"processing" | "completed">("completed");
   const [rows, setRows] = useState<SdsRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState("");
+  const role =
+    typeof window !== "undefined"
+      ? localStorage.getItem("role") ?? sessionStorage.getItem("role")
+      : null;
 
   const fetchDocs = useCallback(async () => {
     try {
       setLoading(true);
-      const res = await fetch(`${API_BASE}/documents`);
+
+      const token = getToken();
+
+      const url = search.trim()
+        ? `${API_BASE}/documents/search?q=${encodeURIComponent(search)}`
+        : `${API_BASE}/documents`;
+
+      const res = await fetch(url, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
       const data: SdsRow[] = await res.json();
       setRows(data);
     } catch (err) {
@@ -48,9 +87,8 @@ function AllSdsPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [search]);
 
-  // Fetch on mount
   useEffect(() => {
     fetchDocs();
   }, [fetchDocs]);
@@ -78,15 +116,17 @@ function AllSdsPage() {
             <Download className="h-4 w-4" />
             Export
           </Button>
-          <UploadSdsDialog
-            onSuccess={fetchDocs}
-            trigger={
-              <Button className="gap-2 shadow-sm">
-                <Upload className="h-4 w-4" />
-                Upload SDS Sheet
-              </Button>
-            }
-          />
+          {role !== "viewer" && (
+            <UploadSdsDialog
+              onSuccess={fetchDocs}
+              trigger={
+                <Button className="gap-2 shadow-sm">
+                  <Upload className="h-4 w-4" />
+                  Upload SDS Sheet
+                </Button>
+              }
+            />
+          )}
         </div>
       </div>
 
@@ -97,6 +137,8 @@ function AllSdsPage() {
             <Input
               placeholder="Search by product, CAS#..."
               className="h-10 rounded-lg pl-9"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
             />
           </div>
           <Select>
@@ -104,10 +146,9 @@ function AllSdsPage() {
               <SelectValue placeholder="Tool Selection" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">Traditional Nlp </SelectItem>
+              <SelectItem value="all">Traditional Nlp</SelectItem>
               <SelectItem value="flammable">LLMs</SelectItem>
               <SelectItem value="toxic">ML Model</SelectItem>
-
             </SelectContent>
           </Select>
           <Button variant="outline" className="h-10 gap-2 text-muted-foreground">
